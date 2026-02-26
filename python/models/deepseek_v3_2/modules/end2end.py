@@ -39,8 +39,9 @@ def dsa_show_hands_prepare_money(
     func_name = f"dsa{mtp_flag}_show_hands_prepare_money{glm5_flag}"
     if mtp_flag:
         return getattr(torch.ops.tilert, func_name)(params, temp_vars, cache_vars, profile_logs)
+    # Non-MTP path: include boolean flags for enable_fused_op and enable_fp8_ops
     return getattr(torch.ops.tilert, func_name)(
-        params, temp_vars, cache_vars, profile_logs, forward_max_seq_len
+        True, False, params, temp_vars, cache_vars, profile_logs
     )
 
 
@@ -57,7 +58,10 @@ def dsa_show_hands_reset(with_mtp: bool = False, is_glm5: bool = False) -> Any:
     mtp_flag = "_mtp_e2e" if with_mtp else ""
     glm5_flag = "_glm5" if is_glm5 else ""
     func_name = f"dsa{mtp_flag}_show_hands_reset{glm5_flag}"
-    return getattr(torch.ops.tilert, func_name)()
+    # MTP version takes no arguments, non-MTP takes a placeholder tensor
+    if mtp_flag:
+        return getattr(torch.ops.tilert, func_name)()
+    return getattr(torch.ops.tilert, func_name)(torch.tensor(0))
 
 
 def dsa_show_hands_go_home(with_mtp: bool = False, is_glm5: bool = False) -> Any:
@@ -65,7 +69,10 @@ def dsa_show_hands_go_home(with_mtp: bool = False, is_glm5: bool = False) -> Any
     mtp_flag = "_mtp_e2e" if with_mtp else ""
     glm5_flag = "_glm5" if is_glm5 else ""
     func_name = f"dsa{mtp_flag}_show_hands_go_home{glm5_flag}"
-    return getattr(torch.ops.tilert, func_name)()
+    # MTP version takes no arguments, non-MTP takes a placeholder tensor
+    if mtp_flag:
+        return getattr(torch.ops.tilert, func_name)()
+    return getattr(torch.ops.tilert, func_name)(torch.tensor(0))
 
 
 def dsa_show_hands_set_sampling_seed(
@@ -422,7 +429,7 @@ class ShowHandsDSALayer:
         with_mtp: bool | None = None,
     ) -> list[DeviceResult]:
         active_mtp = with_mtp if with_mtp is not None else self.with_mtp
-        dsa_show_hands(token_id.cpu(), active_mtp, self.is_glm5)
+        dsa_show_hands(token_id, active_mtp, self.is_glm5)
         return [self._get_device_result(device_id) for device_id in range(self.num_devices)]
 
     def set_sampling_seed(self, seed: int, with_mtp: bool | None = None) -> None:

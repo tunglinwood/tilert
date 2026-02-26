@@ -256,7 +256,8 @@ class SerializableTileRTModule(TileRTModule):
         weights = []
         for op in self.exec_seq:
             weights.extend(op.get_weights_list())
-        return weights
+        # Filter out None values (e.g., missing scales for BF16 models)
+        return [w for w in weights if w is not None]
 
     def device_sharding(self, raw_weights_map: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         sharded_weights_map: dict[str, torch.Tensor] = {}

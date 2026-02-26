@@ -201,7 +201,7 @@ class GLM5Generator:
         for cur_pos_val in range(1, total_len):
             start_time = time.time()
             multi_devices_results = self.decode_layer.forward(
-                tokens[0, prev_pos], with_mtp=with_mtp
+                tokens[:, prev_pos:prev_pos+1], with_mtp=with_mtp
             )
             end_time = time.time()
             time_list.append(end_time - start_time)
