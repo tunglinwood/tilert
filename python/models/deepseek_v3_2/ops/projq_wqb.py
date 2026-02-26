@@ -76,7 +76,7 @@ class ProjqWqbWeightsConverter(TilertWeightsConverter):
                 .transpose(1, 2)
                 .contiguous()
             )
-            if self.model_args.arch_name == "glm_5":
+            if self.model_args.arch_name in ("glm_5", "glm_4_5_air"):
                 if wkv_b_a_scales.dtype != torch.float32:
                     print(
                         "Warning: ProjqWqbWeightsConverter: "

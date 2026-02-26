@@ -105,6 +105,7 @@ class ExpertSelectUpGateSiLUAlgorithm(Enum):
 
     FP8MMA = "fp8mma"
     FP16MMA = "fp16mma"
+    BF16 = "bf16"  # Pass-through for BF16 models (no MMA formatting)
 
 
 class ExpertSelectUpGateSiLUWeightsConverter(TilertWeightsConverter):
@@ -277,7 +278,7 @@ class ExpertSelectUpGateSiLUWeightsConverter(TilertWeightsConverter):
             scales = torch.cat([scales_w1, scales_w3], dim=3)
             assert scales.shape == (exp_num, 16, pages, 2, 8)
 
-            if self.model_args.arch_name == "glm_5":
+            if self.model_args.arch_name in ("glm_5", "glm_4_5_air"):
                 if scales.dtype != torch.float32:
                     print(
                         "Warning: ExpertSelectUpGateSiLUWeightsConverter: "
@@ -330,6 +331,30 @@ class ExpertSelectUpGateSiLUWeightsConverter(TilertWeightsConverter):
             Tuple of weights.
         """
         return self.convert_to_mma(weights_list, "fp16mma")
+
+    def convert_to_bf16(
+        self, weights_list: list[torch.Tensor]
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Convert the weights to bf16 format (pass-through, no MMA formatting).
+        For GLM-4.5-Air and other models with non-standard dimensions.
+
+        Args:
+            weights: List of weights [bias/gamma, gate_weights, gate_scales, up_weights, up_scales].
+
+        Returns:
+            Tuple of (bias/gamma, concatenated weights).
+        """
+        bias_or_gamma, weights_w1, scales_w1, weights_w3, scales_w3 = weights_list
+        
+        # For BF16 pass-through, just return the weights as-is
+        # Concatenate gate and up weights along the last dimension for storage
+        if weights_w3 is not None:
+            combined_weights = torch.cat([weights_w1, weights_w3], dim=-1)
+        else:
+            combined_weights = weights_w1
+            
+        return bias_or_gamma, combined_weights
 
 
 class ExpertSelectUpGateSiLU(TileRTModule):
@@ -433,21 +458,30 @@ class ExpertSelectUpGateSiLU(TileRTModule):
         up_proj_scale_key = f"{key_prefix}.up_proj.weight_scale_inv"
 
         gate_proj_weight = weights_hf[gate_proj_weight_key]
-        gate_proj_scale = weights_hf[gate_proj_scale_key]
+        gate_proj_scale = weights_hf.get(gate_proj_scale_key, None)
         up_proj_weight = weights_hf[up_proj_weight_key]
-        up_proj_scale = weights_hf[up_proj_scale_key]
+        up_proj_scale = weights_hf.get(up_proj_scale_key, None)
         dim = gate_proj_weight.shape[-1]
         in_dim = gate_proj_weight.shape[-2]
-        scale_dim = gate_proj_scale.shape[-1]
-        in_scale_dim = gate_proj_scale.shape[-2]
         in_dim_per_device = in_dim // num_devices
-        in_scale_dim_per_device = in_scale_dim // num_devices
+        
+        # Handle both FP8 (with scales) and BF16/FP16 (without scales)
+        if gate_proj_scale is not None:
+            scale_dim = gate_proj_scale.shape[-1]
+            in_scale_dim = gate_proj_scale.shape[-2]
+            in_scale_dim_per_device = in_scale_dim // num_devices
+            gate_proj_scale = gate_proj_scale.reshape(
+                num_devices, 1, in_scale_dim_per_device, scale_dim
+            )
+            up_proj_scale = up_proj_scale.reshape(
+                num_devices, 1, in_scale_dim_per_device, scale_dim
+            )
+        else:
+            gate_proj_scale = None
+            up_proj_scale = None
+            
         gate_proj_weight = gate_proj_weight.reshape(num_devices, 1, in_dim_per_device, dim)
-        gate_proj_scale = gate_proj_scale.reshape(
-            num_devices, 1, in_scale_dim_per_device, scale_dim
-        )
         up_proj_weight = up_proj_weight.reshape(num_devices, 1, in_dim_per_device, dim)
-        up_proj_scale = up_proj_scale.reshape(num_devices, 1, in_scale_dim_per_device, scale_dim)
         return gate_proj_weight, gate_proj_scale, up_proj_weight, up_proj_scale
 
     def device_sharding(self, weights_map: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
@@ -492,17 +526,21 @@ class ExpertSelectUpGateSiLU(TileRTModule):
             up_scales_list.append(up_scales)
 
         gate_weights = torch.cat(gate_weights_list, dim=1)
-        gate_scales = torch.cat(gate_scales_list, dim=1)
         up_weights = torch.cat(up_weights_list, dim=1)
-        up_scales = torch.cat(up_scales_list, dim=1)
+        # Handle scales only if they exist (FP8 models), otherwise None (BF16/FP16 models)
+        gate_scales = torch.cat(gate_scales_list, dim=1) if gate_scales_list[0] is not None else None
+        up_scales = torch.cat(up_scales_list, dim=1) if up_scales_list[0] is not None else None
         tilert_alias = self.tilert_weights_alias
-        return {
+        result = {
             tilert_alias.exp_bias: bias,
             tilert_alias.exp_gate_weights: gate_weights,
-            tilert_alias.exp_gate_scales: gate_scales,
             tilert_alias.exp_up_weights: up_weights,
-            tilert_alias.exp_up_scales: up_scales,
         }
+        if gate_scales is not None:
+            result[tilert_alias.exp_gate_scales] = gate_scales
+        if up_scales is not None:
+            result[tilert_alias.exp_up_scales] = up_scales
+        return result
 
     def init_reference_weights(
         self,
@@ -544,7 +582,13 @@ class ExpertSelectUpGateSiLU(TileRTModule):
             state_dict: State dict keyed by tilert_weights_alias() (per-device).
         """
         assert self.algorithm is not None, "Algorithm is not set"
-        weights_list = [state_dict[alias] for alias in self.tilert_weights_alias()]
+        # Handle missing keys (e.g., scales for non-quantized models)
+        weights_list = []
+        for alias in self.tilert_weights_alias():
+            if alias in state_dict:
+                weights_list.append(state_dict[alias])
+            else:
+                weights_list.append(None)
         self.tilert_bias, self.tilert_weights = ExpertSelectUpGateSiLUWeightsConverter(
             self.model_args, self.num_devices
         ).dispatch(self.algorithm, weights_list)
@@ -604,7 +648,7 @@ class ExpertSelectUpGateSiLU(TileRTModule):
         ]
         moe_inter_dim_scale_dim = self.moe_inter_dim // self.block_size
         dim_scale_dim = self.dim // self.block_size
-        scale_dtype = torch.float32 if self.arch_name == "glm_5" else torch.bfloat16
+        scale_dtype = torch.float32 if self.arch_name in ("glm_5", "glm_4_5_air") else torch.bfloat16
         gate_scales = [
             torch.randn(moe_inter_dim_scale_dim, dim_scale_dim, dtype=scale_dtype, device=device)
             for _ in range(self.n_routed_experts + 1)

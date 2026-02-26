@@ -98,6 +98,7 @@ class DownAllReduceAlgorithm(Enum):
     """DownAllReduce algorithm"""
 
     GENERAL = "general"
+    BF16 = "bf16"  # Pass-through for BF16 models
 
 
 DownAllReduceWeightsConverter = ExpertDownAllReduceWeightsConverter
@@ -168,7 +169,7 @@ class DownAllReduce(TileRTModule):
 
         if self.arch_name == "deepseek_v3_2":
             self.down_allreduce_func = down_allreduce
-        elif self.arch_name == "glm_5":
+        elif self.arch_name in ["glm_5", "glm_4_5_air"]:
             self.down_allreduce_func = down_allreduce_glm5
         else:
             raise ValueError(f"Unsupported architecture: {self.arch_name}")
@@ -218,38 +219,77 @@ class DownAllReduce(TileRTModule):
         down_proj_weight_key = f"{key_prefix}.down_proj.weight"
         down_proj_scale_key = f"{key_prefix}.down_proj.weight_scale_inv"
         down_proj_weight = weights_dict[down_proj_weight_key]
-        down_proj_scale = weights_dict[down_proj_scale_key]
+        down_proj_scale = weights_dict.get(down_proj_scale_key, None)
+        
+        # Determine if this is a dense layer by checking the weight shape
+        # Dense layer: [dim, inter_dim], MoE layer: [dim, n_experts * moe_inter_dim]
+        actual_inter_dim = down_proj_weight.shape[-1]
+        is_dense_layer = actual_inter_dim == self.inter_dim
+        
         # To match the old convertcode
-        down_proj_weight = down_proj_weight.reshape(
-            self.dim, self.n_experts, self.num_devices, self.moe_inter_dim_per_device
-        )
-        down_proj_weight_splited = torch.split(down_proj_weight, 1, dim=2)
+        # Handle dense vs MoE layers
+        if is_dense_layer:
+            # Dense layer: reshape [dim, inter_dim] -> [dim, 1, num_devices, inter_dim_per_device]
+            inter_dim_per_device = actual_inter_dim // self.num_devices
+            down_proj_weight = down_proj_weight.reshape(
+                self.dim, 1, self.num_devices, inter_dim_per_device
+            )
+            down_proj_weight_splited = torch.split(down_proj_weight, 1, dim=2)
+            down_proj_weight_splited = [
+                down_proj_weight_splited[i]
+                .reshape(self.dim, inter_dim_per_device)
+                .contiguous()
+                for i in range(self.num_devices)
+            ]
+        else:
+            # MoE layer
+            down_proj_weight = down_proj_weight.reshape(
+                self.dim, self.n_experts, self.num_devices, self.moe_inter_dim_per_device
+            )
+            down_proj_weight_splited = torch.split(down_proj_weight, 1, dim=2)
+            down_proj_weight_splited = [
+                down_proj_weight_splited[i]
+                .reshape(self.dim, self.n_experts, self.moe_inter_dim_per_device)
+                .transpose(0, 1)
+                .contiguous()
+                for i in range(self.num_devices)
+            ]
 
-        down_proj_weight_splited = [
-            down_proj_weight_splited[i]
-            .reshape(self.dim, self.n_experts, self.moe_inter_dim_per_device)
-            .transpose(0, 1)
-            .contiguous()
-            for i in range(self.num_devices)
-        ]
-
-        down_proj_scale = down_proj_scale.reshape(
-            self.dim_scale_dim,
-            self.n_experts,
-            self.num_devices,
-            self.moe_inter_scale_dim_per_device,
-        )
-        down_proj_scale_splited = torch.split(down_proj_scale, 1, dim=2)
-        down_proj_scale_splited = [
-            down_proj_scale_splited[i]
-            .reshape(self.dim_scale_dim, self.n_experts, self.moe_inter_scale_dim_per_device)
-            .transpose(0, 1)
-            .contiguous()
-            for i in range(self.num_devices)
-        ]
+        if down_proj_scale is not None:
+            actual_scale_dim = down_proj_scale.shape[-1]
+            is_dense_scale = actual_scale_dim == self.in_scale_dim
+            if is_dense_scale:
+                inter_scale_dim_per_device = actual_scale_dim // self.num_devices
+                down_proj_scale = down_proj_scale.reshape(
+                    self.dim_scale_dim, 1, self.num_devices, inter_scale_dim_per_device
+                )
+                down_proj_scale_splited = torch.split(down_proj_scale, 1, dim=2)
+                down_proj_scale_splited = [
+                    down_proj_scale_splited[i]
+                    .reshape(self.dim_scale_dim, inter_scale_dim_per_device)
+                    .contiguous()
+                    for i in range(self.num_devices)
+                ]
+            else:
+                down_proj_scale = down_proj_scale.reshape(
+                    self.dim_scale_dim, self.n_experts, self.num_devices, self.moe_inter_scale_dim_per_device
+                )
+                down_proj_scale_splited = torch.split(down_proj_scale, 1, dim=2)
+                down_proj_scale_splited = [
+                    down_proj_scale_splited[i]
+                    .reshape(self.dim_scale_dim, self.n_experts, self.moe_inter_scale_dim_per_device)
+                    .transpose(0, 1)
+                    .contiguous()
+                    for i in range(self.num_devices)
+                ]
+        else:
+            down_proj_scale_splited = [None] * self.num_devices
         down_weights = torch.stack(down_proj_weight_splited, dim=0)
-        down_scales = torch.stack(down_proj_scale_splited, dim=0)
-        return down_weights.contiguous(), down_scales.contiguous()
+        if down_proj_scale is not None:
+            down_scales = torch.stack(down_proj_scale_splited, dim=0)
+        else:
+            down_scales = None
+        return down_weights.contiguous(), down_scales.contiguous() if down_scales is not None else None
 
     def init_reference_weights(
         self,
@@ -283,9 +323,16 @@ class DownAllReduce(TileRTModule):
             state_dict: State dictionary.
         """
         assert self.algorithm is not None, "Algorithm is not set"
+        # Handle missing keys (e.g., scales for non-quantized models)
+        weights_list = []
+        for alias in self.tensor_alias:
+            if alias in state_dict:
+                weights_list.append(state_dict[alias])
+            else:
+                weights_list.append(None)
         self.tilert_weights, self.tilert_scales = DownAllReduceWeightsConverter(
             self.model_args, self.num_devices
-        ).dispatch(self.algorithm, [state_dict[alias] for alias in self.tensor_alias])
+        ).dispatch(self.algorithm, weights_list)
 
     def init_tilert_vars(self, batch_size: int, seq_len: int, device_id: int = 0) -> None:
         """
@@ -306,7 +353,7 @@ class DownAllReduce(TileRTModule):
 
     def init_random_weights(self, device_id: int = 0) -> None:
         """Initialize the random weights."""
-        scale_dtype = torch.float32 if self.arch_name == "glm_5" else torch.bfloat16
+        scale_dtype = torch.float32 if self.arch_name in ["glm_5", "glm_4_5_air"] else torch.bfloat16
         down_weights = torch.randn(
             self.dim, self.inter_dim, dtype=torch.bfloat16, device=f"cuda:{device_id}"
         ).to(torch.float8_e4m3fn)

@@ -23,7 +23,7 @@ class Dsa(SerializableTileRTModule):
 
         for layer_idx in range(model_args.n_layers):
             block_type = MlpBlock if layer_idx < model_args.n_dense_layers else MoeBlock
-            block = block_type(model_args=model_args, device_id=device_id, num_devices=num_devices)
+            block = block_type(model_args=model_args, device_id=device_id, num_devices=num_devices, layer_idx=layer_idx)
             self.register_op(block, prefix=f"layer_{layer_idx}_", suffix=f"_dev_{device_id}")
 
         self.register_op(

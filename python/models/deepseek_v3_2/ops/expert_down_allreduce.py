@@ -85,6 +85,7 @@ class ExpertDownAllReduceAlgorithm(Enum):
     """ExpertDownAllReduce algorithm."""
 
     GENERAL = "general"
+    BF16 = "bf16"  # Pass-through for BF16 models (no formatting)
 
 
 class ExpertDownAllReduceWeightsConverter(TilertWeightsConverter):
@@ -109,7 +110,7 @@ class ExpertDownAllReduceWeightsConverter(TilertWeightsConverter):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Convert weights to general (tilert) format."""
         args = self.model_args
-        assert args.arch_name in ("deepseek_v3_2", "glm_5")
+        assert args.arch_name in ("deepseek_v3_2", "glm_5", "glm_4_5_air")
         arch_name = args.arch_name
         dim = args.dim
         num_sms = 128
@@ -156,6 +157,15 @@ class ExpertDownAllReduceWeightsConverter(TilertWeightsConverter):
             else:  # DS v3.2, use bfloat16 for mat_scale_tilert
                 mat_scale_tilert = mat_scale_tilert.to(torch.bfloat16)
             return mat_in_swizzled.contiguous(), mat_scale_tilert.contiguous()
+
+    def convert_to_bf16(
+        self, weights_list: list[torch.Tensor]
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Convert weights to bf16 format (pass-through, no formatting)."""
+        mat_in, scale_in = weights_list
+        # For BF16 pass-through, return weights as-is
+        # Return None for scales if not present
+        return mat_in, scale_in
 
 
 @dataclass
@@ -208,7 +218,7 @@ class ExpertDownAllReduce(TileRTModule):
 
         if self.arch_name == "deepseek_v3_2":
             self.exp_down_allreduce_func = expert_down_allreduce
-        elif self.arch_name == "glm_5":
+        elif self.arch_name in ["glm_5", "glm_4_5_air"]:
             self.exp_down_allreduce_func = expert_down_allreduce_glm5
         else:
             raise ValueError(f"Unsupported architecture: {self.arch_name}")
@@ -234,29 +244,30 @@ class ExpertDownAllReduce(TileRTModule):
         key_prefix: str,
         weights_hf: dict[str, torch.Tensor],
         num_devices: int,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         down_proj_weight_key = f"{key_prefix}.down_proj.weight"
         down_proj_scale_key = f"{key_prefix}.down_proj.weight_scale_inv"
         down_proj_weight = weights_hf[down_proj_weight_key]
-        down_proj_scale = weights_hf[down_proj_scale_key]
+        down_proj_scale = weights_hf.get(down_proj_scale_key, None)
 
         dim = down_proj_weight.shape[-2]
-        dim_scale_dim = down_proj_scale.shape[-2]
         moe_inter_dim = down_proj_weight.shape[-1]
-        in_scale_dim = down_proj_scale.shape[-1]
         moe_inter_dim_per_device = moe_inter_dim // num_devices
-        in_scale_dim_per_device = in_scale_dim // num_devices
 
         down_proj_weight = down_proj_weight.reshape(dim, num_devices, moe_inter_dim_per_device)
         down_proj_weight = down_proj_weight.transpose(0, 1).reshape(
             num_devices, 1, dim, moe_inter_dim_per_device
         )
-        down_proj_scale = down_proj_scale.reshape(
-            dim_scale_dim, num_devices, in_scale_dim_per_device
-        )
-        down_proj_scale = down_proj_scale.transpose(0, 1).reshape(
-            num_devices, 1, dim_scale_dim, in_scale_dim_per_device
-        )
+        if down_proj_scale is not None:
+            dim_scale_dim = down_proj_scale.shape[-2]
+            in_scale_dim = down_proj_scale.shape[-1]
+            in_scale_dim_per_device = in_scale_dim // num_devices
+            down_proj_scale = down_proj_scale.reshape(
+                dim_scale_dim, num_devices, in_scale_dim_per_device
+            )
+            down_proj_scale = down_proj_scale.transpose(0, 1).reshape(
+                num_devices, 1, dim_scale_dim, in_scale_dim_per_device
+            )
         return down_proj_weight, down_proj_scale
 
     def device_sharding(
@@ -281,8 +292,9 @@ class ExpertDownAllReduce(TileRTModule):
             down_weights_list.append(down_weights)
             down_scales_list.append(down_scales)
         down_weights = torch.cat(down_weights_list, dim=1)
-        down_scales = torch.cat(down_scales_list, dim=1)
-        return down_weights.contiguous(), down_scales.contiguous()
+        # Handle scales only if they exist (FP8 models), otherwise None (BF16/FP16 models)
+        down_scales = torch.cat(down_scales_list, dim=1) if down_scales_list[0] is not None else None
+        return down_weights.contiguous(), down_scales
 
     def init_reference_weights(
         self,
@@ -302,9 +314,16 @@ class ExpertDownAllReduce(TileRTModule):
 
     def init_tilert_weights(self, state_dict: dict[str, torch.Tensor]) -> None:
         assert self.algorithm is not None, "Algorithm is not set"
+        # Handle missing keys (e.g., scales for non-quantized models)
+        weights_list = []
+        for alias in self.tensor_alias:
+            if alias in state_dict:
+                weights_list.append(state_dict[alias])
+            else:
+                weights_list.append(None)
         self.tilert_weights, self.tilert_scales = ExpertDownAllReduceWeightsConverter(
             self.model_args, self.num_devices
-        ).dispatch(self.algorithm, [state_dict[alias] for alias in self.tensor_alias])
+        ).dispatch(self.algorithm, weights_list)
 
     def init_tilert_vars(self, batch_size: int, seq_len: int, device_id: int = 0) -> None:
         self.hidden_out = torch.zeros(
@@ -324,7 +343,7 @@ class ExpertDownAllReduce(TileRTModule):
         ]
         dim_scale_dim = self.dim // self.block_size
         moe_inter_dim_scale_dim = self.moe_inter_dim // self.block_size
-        scale_dtype = torch.float32 if self.arch_name == "glm_5" else torch.bfloat16
+        scale_dtype = torch.float32 if self.arch_name in ("glm_5", "glm_4_5_air") else torch.bfloat16
         down_scales = [
             torch.randn(
                 dim_scale_dim,

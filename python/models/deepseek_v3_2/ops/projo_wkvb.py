@@ -66,7 +66,7 @@ class ProjoWKVbWeightsConverter(TilertWeightsConverter):
             # wkv_b_scales: (n_local_heads, v_head_dim // block_size, kv_lora_rank // block_size)
             wkv_b_b = tilert_wkv_b_weights.contiguous()
             wkv_b_b_scales = tilert_wkv_b_scales.contiguous()
-            if self.model_args.arch_name == "glm_5":
+            if self.model_args.arch_name in ("glm_5", "glm_4_5_air"):
                 if wkv_b_b_scales.dtype != torch.float32:
                     print(
                         "Warning: ProjoWKVbWeightsConverter: "

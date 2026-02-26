@@ -180,9 +180,14 @@ class MTPPreprocessLayer(TileRTModule):
         - Ref keys: enorm.weight, hnorm.weight, eh_proj.weight (then convert)
         """
         converter = MTPPreprocessWeightsConverter(self.model_args, self.num_devices)
-        params = converter.convert_to_tilert(
-            [state_dict[k] for k in self.tilert_weights_alias()], self.device_id
-        )
+        # Handle missing keys gracefully
+        weights_list = []
+        for k in self.tilert_weights_alias():
+            if k in state_dict:
+                weights_list.append(state_dict[k])
+            else:
+                weights_list.append(None)
+        params = converter.convert_to_tilert(weights_list, self.device_id)
         self.tilert_embedding_rmsnorm_gamma = params[0]
         self.tilert_hidden_rmsnorm_gamma = params[1]
         self.tilert_eh_proj_weights = params[2]

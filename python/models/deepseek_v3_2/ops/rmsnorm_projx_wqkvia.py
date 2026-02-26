@@ -816,7 +816,7 @@ class RMSNormProjxWqkvia(TileRTModule):
             self.rmsnorm_proj_func = rmsnorm_projx_wqkvia
             self.rmsnorm_func = rmsnorm_quant
             self.proj_func = projx_wqkvia
-        elif self.arch_name == "glm_5":
+        elif self.arch_name in ("glm_5", "glm_4_5_air"):
             # Lazy import to avoid circular import
             self.rmsnorm_proj_func = None
             self.rmsnorm_func = rmsnorm_quant
@@ -948,9 +948,16 @@ class RMSNormProjxWqkvia(TileRTModule):
             state_dict: State dictionary.
         """
         assert self.algorithm is not None, "Algorithm is not set"
+        # Handle missing keys (e.g., scales for non-quantized models)
+        weights_list = []
+        for alias in self.tilert_weights_alias():
+            if alias in state_dict:
+                weights_list.append(state_dict[alias])
+            else:
+                weights_list.append(None)
         self.tilert_norm_gamma, self.tilert_wqkv_a = RMSNormProjxWqkviaWeightsConverter(
             self.model_args, self.num_devices
-        ).dispatch(self.algorithm, [state_dict[alias] for alias in self.tilert_weights_alias()])
+        ).dispatch(self.algorithm, weights_list)
 
     def init_tilert_vars(self, batch_size: int, seq_len: int) -> None:
         """
@@ -985,7 +992,7 @@ class RMSNormProjxWqkvia(TileRTModule):
         kv_scale_dim = (self.kv_lora_rank + self.qk_rope_head_dim) // self.block_size + 1
         wk_scale_dim = self.idx_head_dim // self.block_size
         dim_scale_dim = self.dim // self.block_size
-        scale_dtype = torch.float32 if self.arch_name == "glm_5" else torch.bfloat16
+        scale_dtype = torch.float32 if self.arch_name in ("glm_5", "glm_4_5_air") else torch.bfloat16
 
         tensor_list = [
             torch.randn(self.dim, dtype=torch.float32),

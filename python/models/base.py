@@ -288,9 +288,13 @@ class SerializableTileRTModule(TileRTModule):
             op_state_dict = {}
             for op_key in op.get_tilert_weights_alias():
                 original_key = f"{prefix}{op_key}{suffix}"
-                op_state_dict[op_key] = state_dict[original_key]
-                if self.remove_selected:
-                    keys_to_remove.add(original_key)
+                if original_key in state_dict:
+                    op_state_dict[op_key] = state_dict[original_key]
+                    if self.remove_selected:
+                        keys_to_remove.add(original_key)
+                else:
+                    # Skip missing keys (e.g., scales for non-quantized models)
+                    pass
             op.init_tilert_weights(op_state_dict)
             if self.remove_selected and not retain_weights:
                 for k in keys_to_remove:

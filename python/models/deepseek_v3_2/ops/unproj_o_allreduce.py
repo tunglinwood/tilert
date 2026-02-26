@@ -120,7 +120,7 @@ class UnProjOAllReduceWeightsConverter(TilertWeightsConverter):
             Tuple of weights.
         """
         args = self.model_args
-        assert args.arch_name == "deepseek_v3_2" or args.arch_name == "glm_5"
+        assert args.arch_name in ("deepseek_v3_2", "glm_5", "glm_4_5_air")
         arch_name = args.arch_name
         dim = args.dim
         num_sms = 128
@@ -145,7 +145,7 @@ class UnProjOAllReduceWeightsConverter(TilertWeightsConverter):
             weights_trt = self._swizzle_qmma_16x32(weights_trt)
             weights_trt = weights_trt.reshape(num_sms, stages, -1)
 
-            if arch_name == "glm_5":
+            if arch_name in ("glm_5", "glm_4_5_air"):
                 if scales_trt.dtype != torch.float32:
                     print(
                         "Warning: UnProjOAllReduceWeightsConverter: "
@@ -325,11 +325,18 @@ class UnProjOAllReduce(TileRTModule):
             state_dict: State dictionary keyed by tilert weight alias (per-device).
         """
         assert self.algorithm is not None, "Algorithm is not set"
+        # Handle missing keys (e.g., scales for non-quantized models)
+        weights_list = []
+        for alias in self.tilert_weights_alias():
+            if alias in state_dict:
+                weights_list.append(state_dict[alias])
+            else:
+                weights_list.append(None)
         self.tilert_weights, self.tilert_scales = UnProjOAllReduceWeightsConverter(
             self.model_args, self.num_devices
         ).dispatch(
             self.algorithm,
-            [state_dict[alias] for alias in self.tilert_weights_alias()],
+            weights_list,
         )
 
     def init_tilert_vars(self, batch_size: int, seq_len: int) -> None:
@@ -359,7 +366,7 @@ class UnProjOAllReduce(TileRTModule):
 
         head_scale_dim = self.head_dim // self.block_size
         dim_scale_dim = self.dim // self.block_size
-        scale_dtype = torch.float32 if self.arch_name == "glm_5" else torch.bfloat16
+        scale_dtype = torch.float32 if self.arch_name in ("glm_5", "glm_4_5_air") else torch.bfloat16
         unproj_o_scales = torch.randn(
             dim_scale_dim,
             self.n_heads * head_scale_dim,

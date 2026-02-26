@@ -68,7 +68,7 @@ class EHProjAllReduceWeightsConverter(TilertWeightsConverter):
             Tuple of weights.
         """
         args = self.model_args
-        assert args.arch_name == "deepseek_v3_2" or args.arch_name == "glm_5"
+        assert args.arch_name in ("deepseek_v3_2", "glm_5", "glm_4_5_air")
         dim = args.dim
         num_sms = 128
         dim_per_sm = dim // num_sms
@@ -208,9 +208,16 @@ class EHProjAllReduce(TileRTModule):
             state_dict: State dictionary.
         """
         assert self.algorithm is not None
+        # Handle missing keys (e.g., scales for non-quantized models)
+        weights_list = []
+        for alias in self.tensor_alias:
+            if alias in state_dict:
+                weights_list.append(state_dict[alias])
+            else:
+                weights_list.append(None)
         (self.tilert_proj,) = EHProjAllReduceWeightsConverter(
             self.model_args, self.num_devices
-        ).dispatch(self.algorithm, [state_dict[alias] for alias in self.tensor_alias])
+        ).dispatch(self.algorithm, weights_list)
 
     def init_tilert_vars(self, batch_size: int, seq_len: int, device_id: int = 0) -> None:
         """

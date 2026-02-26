@@ -12,6 +12,7 @@ from tilert.models.deepseek_v3_2.generator import DSAv32Generator
 from tilert.models.deepseek_v3_2.model_args import ModelArgs as DSAv32ModelArgs
 from tilert.models.glm_5.generator import GLM5Generator
 from tilert.models.glm_5.model_args import ModelArgsGLM5
+from tilert.models.glm_4_5_air.model_args import ModelArgsGLM4P5Air
 
 
 def get_generator(
@@ -26,7 +27,7 @@ def get_generator(
     sampling_seed: int = 42,
 ) -> DSAv32Generator | GLM5Generator:
     """Get the appropriate generator based on model type."""
-    assert model_type in ["deepseek_v3_2", "glm5"]
+    assert model_type in ["deepseek_v3_2", "glm5", "glm_4_5_air"]
     if model_type == "deepseek_v3_2":
         model_args = DSAv32ModelArgs()
         return DSAv32Generator(
@@ -40,6 +41,21 @@ def get_generator(
             use_topp=top_p < 1.0,
             sampling_seed=sampling_seed,
         )
+    elif model_type == "glm_4_5_air":
+        model_args = ModelArgsGLM4P5Air()
+        return GLM5Generator(
+            model_args=model_args,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            model_weights_dir=model_weights_dir,
+            with_mtp=with_mtp,
+            top_p=top_p,
+            top_k=top_k,
+            use_topp=top_p < 1.0,
+            enable_thinking=enable_thinking,
+            sampling_seed=sampling_seed,
+        )
+    # glm5
     model_args = ModelArgsGLM5()
     return GLM5Generator(
         model_args=model_args,
@@ -67,7 +83,7 @@ def parse_args():  # type: ignore
         "--model",
         type=str,
         default="deepseek_v3_2",
-        choices=["deepseek_v3_2", "glm5"],
+        choices=["deepseek_v3_2", "glm5", "glm_4_5_air"],
         help="Model type to use (default: deepseek_v3_2)",
     )
     parser.add_argument("--max-new-tokens", type=int, default=4000, help="Max tokens to generate")

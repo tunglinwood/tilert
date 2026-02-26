@@ -244,7 +244,7 @@ class RmsnormProjqWqibWeightsConverter(TilertWeightsConverter):
         q_norm_weight: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Convert common weights to TileRT FP16 MMA layout."""
-        assert self.model_args.arch_name == "glm_5", "Only GLM-5 supports FP16 MMA"
+        assert self.model_args.arch_name in ("glm_5", "glm_4_5_air"), "Only GLM-5 and GLM-4.5-Air support FP16 MMA"
 
         if wq_b_scale.dtype != torch.float32:
             print(
@@ -598,7 +598,7 @@ class RmsnormProjqWqib(TileRTModule):
         wq_b = torch.randn(
             self.num_devices * self.qk_local_dim, self.q_lora_rank, dtype=torch.bfloat16
         ).to(torch.float8_e4m3fn)
-        scale_dtype = torch.float32 if self.model_args.arch_name == "glm_5" else torch.bfloat16
+        scale_dtype = torch.float32 if self.model_args.arch_name in ("glm_5", "glm_4_5_air") else torch.bfloat16
         wq_b_scale = torch.randn(
             self.num_devices * self.qk_local_qdim, self.q_lora_qdim, dtype=scale_dtype
         )

@@ -18,7 +18,6 @@ from tilert.models.deepseek_v3_2.ops.expert_sel_up_gate_silu import ExpertSelect
 from tilert.models.deepseek_v3_2.ops.rmsnorm_head_proj import RMSNormHeadProj
 from tilert.models.deepseek_v3_2.ops.rmsnorm_up_gate_silu import RMSNormUpGateSiLU
 from tilert.models.glm_5.model_args import ModelArgsGLM5
-from tilert.models.glm_4_5_air.model_args import ModelArgsGLM4P5Air
 
 __all__ = [
     "WeightConverter",
@@ -254,57 +253,6 @@ class WeightConverter:
         weights_hf: dict[str, torch.Tensor],
         layer_id: int,
     ) -> dict[str, dict[str, torch.Tensor]]:
-        # Check if using GQA (GLM-4.5-Air), standard MHA, or MLA (DeepSeek/GLM-5)
-        n_kv_heads = getattr(self.model_args, 'n_kv_heads', self.model_args.n_heads)
-        
-        if n_kv_heads < self.model_args.n_heads:
-            # GQA - GLM-4.5-Air style
-            from tilert.models.deepseek_v3_2.modules.gqa import Gqa
-            
-            # Create a GQA instance to get proper device sharding
-            gqa = Gqa(self.model_args, device_id=0, num_devices=self.num_devices, layer_idx=layer_id)
-            gqa_raw_dict = {
-                f"model.layers.{layer_id}.input_layernorm.weight": weights_hf[f"model.layers.{layer_id}.input_layernorm.weight"],
-                f"model.layers.{layer_id}.self_attn.q_proj.weight": weights_hf[f"model.layers.{layer_id}.self_attn.q_proj.weight"],
-                f"model.layers.{layer_id}.self_attn.k_proj.weight": weights_hf[f"model.layers.{layer_id}.self_attn.k_proj.weight"],
-                f"model.layers.{layer_id}.self_attn.v_proj.weight": weights_hf[f"model.layers.{layer_id}.self_attn.v_proj.weight"],
-                f"model.layers.{layer_id}.self_attn.o_proj.weight": weights_hf[f"model.layers.{layer_id}.self_attn.o_proj.weight"],
-            }
-            gqa_sharded_dict = gqa.device_sharding(gqa_raw_dict)
-            
-            # Extract per-device weights from stacked tensors
-            result: dict[str, dict[str, torch.Tensor]] = {}
-            for dev_id in range(self.num_devices):
-                result[f"dev_{dev_id}"] = {}
-                for key, value in gqa_sharded_dict.items():
-                    # All values should be stacked tensors with shape [num_devices, ...]
-                    result[f"dev_{dev_id}"][key] = value[dev_id].contiguous()
-            
-            return result
-        
-        elif getattr(self.model_args, 'q_lora_rank', None) == 0:
-            # Standard MHA
-            from tilert.models.deepseek_v3_2.modules.mha import Mha
-            
-            mha = Mha(self.model_args, device_id=0, num_devices=self.num_devices, layer_idx=layer_id)
-            mha_raw_dict = {
-                f"model.layers.{layer_id}.input_layernorm.weight": weights_hf[f"model.layers.{layer_id}.input_layernorm.weight"],
-                f"model.layers.{layer_id}.self_attn.q_proj.weight": weights_hf[f"model.layers.{layer_id}.self_attn.q_proj.weight"],
-                f"model.layers.{layer_id}.self_attn.k_proj.weight": weights_hf[f"model.layers.{layer_id}.self_attn.k_proj.weight"],
-                f"model.layers.{layer_id}.self_attn.v_proj.weight": weights_hf[f"model.layers.{layer_id}.self_attn.v_proj.weight"],
-                f"model.layers.{layer_id}.self_attn.o_proj.weight": weights_hf[f"model.layers.{layer_id}.self_attn.o_proj.weight"],
-            }
-            mha_sharded_dict = mha.device_sharding(mha_raw_dict)
-            
-            result: dict[str, dict[str, torch.Tensor]] = {}
-            for dev_id in range(self.num_devices):
-                result[f"dev_{dev_id}"] = {}
-                for key, value in mha_sharded_dict.items():
-                    result[f"dev_{dev_id}"][key] = value[dev_id].contiguous()
-            
-            return result
-        
-        # MLA path for DeepSeek/GLM-5
         mla_weights_map: dict[str, dict[str, torch.Tensor]] = {}
         for dev_id in range(self.num_devices):
             mla_weights_map.setdefault(f"dev_{dev_id}", {})
@@ -339,19 +287,16 @@ class WeightConverter:
         moe_weights: dict[str, dict[str, torch.Tensor]] = {}
         exp_sel_up_gate_silu = ExpertSelectUpGateSiLU(self.model_args, self.num_devices)
         ref_scope = f"model.layers.{layer_id}."
-        # Filter to only include keys that exist in weights_hf (handles BF16 vs FP8 models)
         exp_weights_map = {
-            k: weights_hf[ref_scope + k]
-            for k in exp_sel_up_gate_silu.ref_weights_alias()
-            if (ref_scope + k) in weights_hf
+            k: weights_hf[ref_scope + k] for k in exp_sel_up_gate_silu.ref_weights_alias()
         }
         exp_sharded = exp_sel_up_gate_silu.device_sharding(exp_weights_map)
         tilert_alias = exp_sel_up_gate_silu.tilert_weights_alias
         exp_bias = exp_sharded[tilert_alias.exp_bias]
         exp_gate_weights = exp_sharded[tilert_alias.exp_gate_weights]
+        exp_gate_scales = exp_sharded[tilert_alias.exp_gate_scales]
         exp_up_weights = exp_sharded[tilert_alias.exp_up_weights]
-        exp_gate_scales = exp_sharded.get(tilert_alias.exp_gate_scales, None)
-        exp_up_scales = exp_sharded.get(tilert_alias.exp_up_scales, None)
+        exp_up_scales = exp_sharded[tilert_alias.exp_up_scales]
         exp_down_allreduce = ExpertDownAllReduce(
             self.model_args, device_id=0, num_devices=self.num_devices
         )
@@ -360,21 +305,21 @@ class WeightConverter:
         )
         for dev_id in range(self.num_devices):
             key = f"dev_{dev_id}"
-            moe_weight_dict: dict[str, torch.Tensor] = {
-                "unproj_o_gamma": post_attn_norm_weight,
-                "exp_proj_weights": mlp_gate_weight,
-                "exp_bias": exp_bias[dev_id],
-                "exp_gate_weights": exp_gate_weights[dev_id],
-                "exp_up_weights": exp_up_weights[dev_id],
-                "exp_down_weights": exp_down_weights[dev_id],
-            }
-            if exp_gate_scales is not None:
-                moe_weight_dict["exp_gate_scales"] = exp_gate_scales[dev_id]
-            if exp_up_scales is not None:
-                moe_weight_dict["exp_up_scales"] = exp_up_scales[dev_id]
-            if exp_down_scales is not None:
-                moe_weight_dict["exp_down_scales"] = exp_down_scales[dev_id]
-            moe_weights.update({key: moe_weight_dict})
+            moe_weights.update(
+                {
+                    key: {
+                        "unproj_o_gamma": post_attn_norm_weight,
+                        "exp_proj_weights": mlp_gate_weight,
+                        "exp_bias": exp_bias[dev_id],
+                        "exp_gate_weights": exp_gate_weights[dev_id],
+                        "exp_gate_scales": exp_gate_scales[dev_id],
+                        "exp_up_weights": exp_up_weights[dev_id],
+                        "exp_up_scales": exp_up_scales[dev_id],
+                        "exp_down_weights": exp_down_weights[dev_id],
+                        "exp_down_scales": exp_down_scales[dev_id],
+                    }
+                }
+            )
         return moe_weights
 
     def transform_mlp(
@@ -403,24 +348,27 @@ class WeightConverter:
 
         weights_upgate: dict[str, dict[str, torch.Tensor]] = {}
         for dev_id in range(self.num_devices):
-            weights_upgate_dict: dict[str, torch.Tensor] = {
-                "gate_weights": gate_weights[dev_id],
-                "up_weights": up_weights[dev_id],
-            }
-            if gate_scales is not None:
-                weights_upgate_dict["gate_scales"] = gate_scales[dev_id]
-            if up_scales is not None:
-                weights_upgate_dict["up_scales"] = up_scales[dev_id]
-            weights_upgate.update({f"dev_{dev_id}": weights_upgate_dict})
+            weights_upgate.update(
+                {
+                    f"dev_{dev_id}": {
+                        "gate_weights": gate_weights[dev_id],
+                        "gate_scales": gate_scales[dev_id],
+                        "up_weights": up_weights[dev_id],
+                        "up_scales": up_scales[dev_id],
+                    }
+                }
+            )
 
         weights_down: dict[str, dict[str, torch.Tensor]] = {}
         for dev_id in range(self.num_devices):
-            weights_down_dict: dict[str, torch.Tensor] = {
-                "down_weights": down_weights[dev_id],
-            }
-            if down_scales is not None:
-                weights_down_dict["down_scales"] = down_scales[dev_id]
-            weights_down.update({f"dev_{dev_id}": weights_down_dict})
+            weights_down.update(
+                {
+                    f"dev_{dev_id}": {
+                        "down_weights": down_weights[dev_id],
+                        "down_scales": down_scales[dev_id],
+                    }
+                }
+            )
 
         mlp_weights: dict[str, dict[str, torch.Tensor]] = {}
         for dev_id in range(self.num_devices):
@@ -739,8 +687,6 @@ if __name__ == "__main__":
         model_args = ModelArgsDsav32()
     elif model_type == "glm-5":
         model_args = ModelArgsGLM5()
-    elif model_type == "glm-4.5-air":
-        model_args = ModelArgsGLM4P5Air()
     else:
         raise ValueError(f"Invalid model type: {model_type}")
 

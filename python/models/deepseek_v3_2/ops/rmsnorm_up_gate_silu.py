@@ -48,6 +48,7 @@ class RMSNormUpGateSiLUAlgorithm(Enum):
 
     FP8MMA = "fp8mma"
     FP16MMA = "fp16mma"
+    BF16 = "bf16"  # Pass-through for BF16 models (no MMA formatting)
 
 
 RMSNormUpGateSiLUWeightsConverter = ExpertSelectUpGateSiLUWeightsConverter
@@ -187,24 +188,34 @@ class RMSNormUpGateSiLU(TileRTModule):
             )
         )
         # Transpose split so to match the old convertcode
-        gate_weights = gate_weights.reshape(self.n_experts, self.num_devices, -1, self.dim)
+        # Compute actual n_experts from weight shape (handles both dense and MoE)
+        total_params = gate_weights.numel()
+        params_per_device_dim = total_params // self.num_devices // self.dim
+        actual_n_experts = total_params // (self.num_devices * params_per_device_dim * self.dim)
+        if actual_n_experts == 0:
+            actual_n_experts = 1
+        gate_weights = gate_weights.reshape(actual_n_experts, self.num_devices, -1, self.dim)
         gate_weights = gate_weights.transpose(0, 1)
-        gate_scales = gate_scales.reshape(
-            self.n_experts, self.num_devices, -1, self.dim // self.block_size
-        )
-        gate_scales = gate_scales.transpose(0, 1)
-        up_weights = up_weights.reshape(self.n_experts, self.num_devices, -1, self.dim)
+        if gate_scales is not None:
+            gate_scales = gate_scales.reshape(
+                actual_n_experts, self.num_devices, -1, self.dim // self.block_size
+            )
+        if gate_scales is not None:
+            gate_scales = gate_scales.transpose(0, 1)
+        up_weights = up_weights.reshape(actual_n_experts, self.num_devices, -1, self.dim)
         up_weights = up_weights.transpose(0, 1)
-        up_scales = up_scales.reshape(
-            self.n_experts, self.num_devices, -1, self.dim // self.block_size
-        )
-        up_scales = up_scales.transpose(0, 1)
+        if up_scales is not None:
+            up_scales = up_scales.reshape(
+                actual_n_experts, self.num_devices, -1, self.dim // self.block_size
+            )
+        if up_scales is not None:
+            up_scales = up_scales.transpose(0, 1)
         return (
             rmsnorm_gamma.contiguous(),
             gate_weights.contiguous(),
-            gate_scales.contiguous(),
+            gate_scales.contiguous() if gate_scales is not None else None,
             up_weights.contiguous(),
-            up_scales.contiguous(),
+            up_scales.contiguous() if up_scales is not None else None,
         )
 
     def init_reference_weights(
@@ -247,9 +258,16 @@ class RMSNormUpGateSiLU(TileRTModule):
             state_dict: State dictionary.
         """
         assert self.algorithm is not None, "Algorithm is not set"
+        # Handle missing keys (e.g., scales for non-quantized models)
+        weights_list = []
+        for alias in self.tilert_weights_alias():
+            if alias in state_dict:
+                weights_list.append(state_dict[alias])
+            else:
+                weights_list.append(None)
         self.tilert_norm_gamma, self.tilert_weights = RMSNormUpGateSiLUWeightsConverter(
             self.model_args, self.num_devices
-        ).dispatch(self.algorithm, [state_dict[alias] for alias in self.tilert_weights_alias()])
+        ).dispatch(self.algorithm, weights_list)
 
     def init_tilert_vars(self, batch_size: int, seq_len: int, dev_id: int = 0) -> None:
         """
@@ -290,7 +308,7 @@ class RMSNormUpGateSiLU(TileRTModule):
         ).to(torch.float8_e4m3fn)
         inter_dim_scale_dim = self.inter_dim // self.block_size
         dim_scale_dim = self.dim // self.block_size
-        scale_dtype = torch.float32 if self.arch_name == "glm_5" else torch.bfloat16
+        scale_dtype = torch.float32 if self.arch_name in ("glm_5", "glm_4_5_air") else torch.bfloat16
         gate_scales = torch.randn(
             inter_dim_scale_dim, dim_scale_dim, dtype=scale_dtype, device=f"cuda:{dev_id}"
         )

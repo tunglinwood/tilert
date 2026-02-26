@@ -104,7 +104,7 @@ class RMSNormHeadProjWeightsConverter(TilertWeightsConverter):
             Tuple of weights.
         """
         args = self.model_args
-        assert args.arch_name == "deepseek_v3_2" or args.arch_name == "glm_5"
+        assert args.arch_name in ("deepseek_v3_2", "glm_5", "glm_4_5_air")
 
         with torch.inference_mode():
             rmsnorm_gamma, mat_in = weights_list
@@ -175,7 +175,7 @@ class RMSNormHeadProj(TileRTModule):
 
         if self.arch_name == "deepseek_v3_2":
             self.rmsnorm_head_proj_func = rmsnorm_head_proj_dsv32
-        elif self.arch_name == "glm_5":
+        elif self.arch_name in ("glm_5", "glm_4_5_air"):
             self.rmsnorm_head_proj_func = rmsnorm_head_proj_glm5
         else:
             raise ValueError(f"Unsupported architecture: {self.arch_name}")
@@ -246,9 +246,16 @@ class RMSNormHeadProj(TileRTModule):
             state_dict: State dictionary.
         """
         assert self.algorithm is not None
+        # Handle missing keys (e.g., scales for non-quantized models)
+        weights_list = []
+        for alias in self.tilert_weights_alias():
+            if alias in state_dict:
+                weights_list.append(state_dict[alias])
+            else:
+                weights_list.append(None)
         self.tilert_rmsnorm_gamma, self.tilert_head_proj = RMSNormHeadProjWeightsConverter(
             self.model_args, self.num_devices
-        ).dispatch(self.algorithm, [state_dict[alias] for alias in self.tilert_weights_alias()])
+        ).dispatch(self.algorithm, weights_list)
 
     def init_tilert_vars(self, batch_size: int, seq_len: int) -> None:
         """

@@ -72,7 +72,9 @@ class ModelArgs:
     score_func: Literal["softmax", "sigmoid"] = "softmax"
     route_scale: float = 2.5
 
-    # mla
+    # Attention (MLA or GQA)
+    n_heads: int = 128
+    n_kv_heads: int = 128  # For GQA: n_kv_heads < n_heads; For MHA: n_kv_heads == n_heads
     q_lora_rank: int = 1536
     kv_lora_rank: int = 512
     qk_nope_head_dim: int = 128

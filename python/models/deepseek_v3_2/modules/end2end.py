@@ -133,8 +133,9 @@ class ShowHandsDSALayer:
         for k_arg, v_arg in model_args.__dict__.items():
             print(f" - {k_arg}: {v_arg}")
         self.model_args = model_args
-        self.is_glm5 = self.model_args.arch_name == "glm_5"
-        assert self.model_args.arch_name in ["deepseek_v3_2", "glm_5"]
+        self.is_glm5 = self.model_args.arch_name in ["glm_5", "glm_4_5_air"]
+        self.is_gqa = getattr(model_args, 'n_kv_heads', model_args.n_heads) < model_args.n_heads
+        assert self.model_args.arch_name in ["deepseek_v3_2", "glm_5", "glm_4_5_air"]
 
         self.num_devices = 8
         self.forward_max_seq_len = 4

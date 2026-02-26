@@ -30,7 +30,7 @@ class Mla(SerializableTileRTModule):
         self.rmsnorm_projx_wqkvia = RMSNormProjxWqkvia(
             model_args=model_args, device_id=device_id, num_devices=num_devices
         )
-        if model_args.arch_name == "glm_5":
+        if model_args.arch_name in ("glm_5", "glm_4_5_air"):
             self.rmsnorm_projx_wqkvia.algorithm = RMSNormProjxWqkviaAlgorithm.DECOUPLED
         else:
             self.rmsnorm_projx_wqkvia.algorithm = RMSNormProjxWqkviaAlgorithm.GENERAL
@@ -44,7 +44,7 @@ class Mla(SerializableTileRTModule):
         self.rmsnorm_projq_wqib = RmsnormProjqWqib(
             model_args=model_args, device_id=device_id, num_devices=num_devices
         )
-        if model_args.arch_name == "glm_5":
+        if model_args.arch_name in ("glm_5", "glm_4_5_air"):
             self.rmsnorm_projq_wqib.algorithm = RmsnormProjqWqibAlgorithm.FP16MMA
         else:
             self.rmsnorm_projq_wqib.algorithm = RmsnormProjqWqibAlgorithm.BF16
@@ -77,7 +77,7 @@ class Mla(SerializableTileRTModule):
             algorithm=UnProjOAllReduceAlgorithm.FP8MMA,
         )
 
-        if model_args.arch_name == "glm_5":
+        if model_args.arch_name in ("glm_5", "glm_4_5_air"):
             self.unproj_o_allreduce.algorithm = UnProjOAllReduceAlgorithm.FP16MMA
 
         self.register_op(self.unproj_o_allreduce)
